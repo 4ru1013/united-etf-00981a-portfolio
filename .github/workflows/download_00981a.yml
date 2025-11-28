@@ -38,7 +38,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -n "$(git status --porcelain)" ]; then
-            git add data/*.xlsx data/html_snapshot/*.html || true
+            # 直接把整個 data 資料夾加入（裡面有 xlsx / html_snapshot）
+            git add data || true
             git commit -m "Auto download 00981A portfolio $(date -u +'%Y-%m-%d')"
             git push
           else
