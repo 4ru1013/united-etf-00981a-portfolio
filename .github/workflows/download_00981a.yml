@@ -38,8 +38,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -n "$(git status --porcelain)" ]; then
-            git add data/*.xlsx
+            git add data/*.xlsx data/html_snapshot/*.html || true
             git commit -m "Auto download 00981A portfolio $(date -u +'%Y-%m-%d')"
             git push
           else
             echo "No changes, nothing to commit."
+          fi
