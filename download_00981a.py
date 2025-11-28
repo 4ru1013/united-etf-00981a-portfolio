@@ -76,10 +76,11 @@ def download_and_save():
         xlsx_url = find_xlsx_url(html)
     except Exception as e:
         print(f"[ERROR] 找不到 XLSX 下載連結：{e}")
-        sys.exit(1)
+        print("[INFO] 目前先只保存 HTML，之後再分析下載連結。")
+        return  # 直接結束函式，不再往下抓 XLSX
 
     print(f"[INFO] 下載連結：{xlsx_url}")
-
+    
     try:
         xlsx_resp = session.get(xlsx_url, headers=headers, timeout=60)
         xlsx_resp.raise_for_status()
