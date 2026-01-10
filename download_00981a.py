@@ -1,10 +1,11 @@
 import datetime as dt
 import pathlib
-import zipfile
-from io import BytesIO
+import re
+from typing import Optional, Tuple
 
 import pandas as pd
 import requests
+from openpyxl import load_workbook
 
 BASE_URL = "https://www.ezmoney.com.tw"
 FUND_CODE = "49YTW"  # 00981A 的 fundCode
@@ -12,48 +13,153 @@ FUND_CODE = "49YTW"  # 00981A 的 fundCode
 INFO_URL = f"{BASE_URL}/ETF/Fund/Info?FundCode={FUND_CODE}"
 EXPORT_URL = f"{BASE_URL}/ETF/Fund/AssetExcelNPOI?fundCode={FUND_CODE}"
 
-DATA_DIR = pathlib.Path("data")
-RAW_DIR = DATA_DIR / "raw"
-PARSED_DIR = DATA_DIR / "parsed"
-DIFF_DIR = DATA_DIR / "diff"
-LATEST_DIR = DATA_DIR / "latest"
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def ensure_dir(p: pathlib.Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
 
-def is_zip_bytes(b: bytes) -> bool:
-    # ZIP magic: PK\x03\x04 or PK\x05\x06 (empty) or PK\x07\x08 (spanned)
-    return len(b) >= 4 and b[:2] == b"PK"
+def roc_to_ad_yyyymmdd(roc_date_str: str) -> Optional[str]:
+    """
+    Accept formats like:
+      - 115/01/09
+      - 115-01-09
+      - 民國115年01月09日
+    Return YYYYMMDD in AD, e.g. 20260109
+    """
+    s = str(roc_date_str).strip()
+    if not s:
+        return None
 
+    # Normalize
+    s = s.replace("年", "/").replace("月", "/").replace("日", "")
+    s = s.replace("-", "/")
 
-def is_xlsx_bytes(b: bytes) -> bool:
-    # xlsx 本質也是 zip，但內容會包含 xl/ 目錄
-    if not is_zip_bytes(b):
-        return False
+    m = re.search(r"(\d{2,3})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})", s)
+    if not m:
+        return None
+
+    roc_year = int(m.group(1))
+    month = int(m.group(2))
+    day = int(m.group(3))
+    ad_year = roc_year + 1911
+
     try:
-        with zipfile.ZipFile(BytesIO(b)) as zf:
-            names = set(zf.namelist())
-            return any(n.startswith("xl/") for n in names)
-    except zipfile.BadZipFile:
-        return False
+        d = dt.date(ad_year, month, day)
+    except ValueError:
+        return None
+    return d.strftime("%Y%m%d")
 
 
-def extract_xlsx_from_zip(zip_bytes: bytes) -> bytes:
-    with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
-        # 找 zip 裡面第一個 .xlsx
-        xlsx_candidates = [n for n in zf.namelist() if n.lower().endswith(".xlsx")]
-        if not xlsx_candidates:
-            # 有些 zip 不是 xlsx，而是其他格式；先把清單丟出來方便 debug
-            raise RuntimeError(f"ZIP 裡沒有 .xlsx，內容清單：{zf.namelist()[:30]}")
-        with zf.open(xlsx_candidates[0]) as f:
-            return f.read()
+def extract_data_date_from_xlsx(xlsx_path: pathlib.Path) -> Optional[str]:
+    """
+    Try to locate "資料日期" in the first sheet within top-left area,
+    then parse ROC date.
+    """
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb.worksheets[0]
+
+    # Scan a reasonable region (top 20 rows, first 10 cols)
+    for r in range(1, 21):
+        for c in range(1, 11):
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            txt = str(v).strip()
+            if "資料日期" in txt:
+                # Common patterns: "資料日期: 115/01/09"
+                # Or the date might be in adjacent cell
+                # 1) try parse in same cell
+                after = txt.split("資料日期", 1)[-1]
+                # remove separators like ":" "："
+                after = after.replace("：", ":")
+                if ":" in after:
+                    after = after.split(":", 1)[-1].strip()
+
+                d = roc_to_ad_yyyymmdd(after)
+                if d:
+                    wb.close()
+                    return d
+
+                # 2) try right cell
+                v2 = ws.cell(row=r, column=c + 1).value
+                d2 = roc_to_ad_yyyymmdd(v2) if v2 is not None else None
+                if d2:
+                    wb.close()
+                    return d2
+
+    wb.close()
+    return None
 
 
-def safe_mkdirs():
-    for d in [DATA_DIR, RAW_DIR, PARSED_DIR, DIFF_DIR, LATEST_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+def find_header_row(df_raw: pd.DataFrame) -> Optional[int]:
+    """
+    df_raw is read with header=None. We scan first N rows to find a row
+    that looks like the real header (contains keywords like 代號/股數/名稱).
+    Return row index (0-based) if found.
+    """
+    # Candidate keywords (you can add more if needed)
+    must_have_any = ["代號", "股票代號", "標的代號", "證券代號"]
+    should_have_any = ["名稱", "標的名稱", "股票名稱", "股名"]
+    shares_any = ["股數", "持股股數", "數量", "持有股數"]
+
+    max_scan = min(40, len(df_raw))
+    for i in range(max_scan):
+        row = df_raw.iloc[i].astype(str).fillna("").tolist()
+        row_join = " ".join([x.strip() for x in row if x and x != "nan"]).strip()
+
+        if not row_join or row_join.lower() == "nan":
+            continue
+
+        has_code = any(k in row_join for k in must_have_any)
+        has_shares = any(k in row_join for k in shares_any)
+        # Sometimes there is no "名稱" but there is code+shares already strong enough
+        has_name = any(k in row_join for k in should_have_any)
+
+        if has_code and has_shares:
+            return i
+        if has_code and has_name and has_shares:
+            return i
+
+    return None
 
 
-def download_bytes() -> bytes:
-    session = requests.Session()
+def normalize_colname(s: str) -> str:
+    return re.sub(r"\s+", "", str(s)).strip()
+
+
+def pick_column(cols, candidates):
+    """
+    Pick first matched column name that contains any candidate substring.
+    """
+    for cand in candidates:
+        for col in cols:
+            if cand in normalize_colname(col):
+                return col
+    return None
+
+
+def to_int_safe(x) -> int:
+    if x is None:
+        return 0
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return 0
+    # remove commas and spaces
+    s = s.replace(",", "").replace(" ", "")
+    # handle something like '1,234.0'
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+# -----------------------------
+# Core: Download, Parse, Diff
+# -----------------------------
+def download_xlsx(session: requests.Session, out_path: pathlib.Path) -> None:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,256 +172,238 @@ def download_bytes() -> bytes:
     resp_info.raise_for_status()
     print("[INFO] 打開基金資訊頁成功")
 
-    resp = session.get(EXPORT_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
-    ct = resp.headers.get("Content-Type", "")
-    print(f"[INFO] 下載 API 回應 Content-Type: {ct}")
-    return resp.content
+    resp_xlsx = session.get(EXPORT_URL, headers=headers, timeout=60)
+    resp_xlsx.raise_for_status()
+    print(f"[INFO] 下載 API 回應 Content-Type: {resp_xlsx.headers.get('Content-Type')}")
+
+    out_path.write_bytes(resp_xlsx.content)
+    print(f"[OK] Saved XLSX to {out_path}")
 
 
-def normalize_to_xlsx_bytes(content: bytes) -> bytes:
+def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    可能回：
-    - 直接 xlsx（其實也是 zip，但含 xl/）
-    - zip 包 xlsx
-    - HTML（被擋/驗證頁）
+    Return standardized holdings DataFrame:
+      columns: code, name, shares
+    and data_date (YYYYMMDD) if found.
     """
-    if is_xlsx_bytes(content):
-        return content
+    data_date = extract_data_date_from_xlsx(xlsx_path)
+    if data_date:
+        print(f"[INFO] data_date = {data_date}")
+    else:
+        print("[WARN] 無法從檔案內抓到資料日期，將以今天日期做檔名（但仍可解析持股）")
 
-    if is_zip_bytes(content):
-        # 是 zip 但不是標準 xlsx（可能 zip 包 xlsx）
-        return extract_xlsx_from_zip(content)
+    # Read sheet with header=None first (robust)
+    df0 = pd.read_excel(xlsx_path, sheet_name=0, header=None, engine="openpyxl")
+    header_row = find_header_row(df0)
+    if header_row is None:
+        # Debug: show first few rows as columns-like
+        preview = df0.head(5).to_string(index=False)
+        raise RuntimeError(
+            "找不到表頭列（代號/股數）。\n"
+            "可能 Excel 格式改了。請檢查 raw 檔案。\n\n"
+            f"前 5 列預覽：\n{preview}"
+        )
 
-    # 不是 zip => 可能是 html / 文字
-    head = content[:200].decode("utf-8", errors="ignore")
-    raise RuntimeError(
-        "下載內容不是 xlsx/zip。可能被擋或回傳 HTML。\n"
-        f"前 200 bytes:\n{head}"
+    # Re-read with correct header
+    df = pd.read_excel(
+        xlsx_path,
+        sheet_name=0,
+        header=header_row,
+        engine="openpyxl",
     )
 
+    # Normalize col names
+    df.columns = [normalize_colname(c) for c in df.columns]
 
-def read_xlsx_to_df(xlsx_bytes: bytes) -> pd.DataFrame:
-    # 先把 xlsx 存成 BytesIO 讀進來
-    bio = BytesIO(xlsx_bytes)
-
-    # 這邊不假設 sheet 名稱，先讀第一個 sheet
-    xls = pd.ExcelFile(bio, engine="openpyxl")
-    df = pd.read_excel(xls, sheet_name=xls.sheet_names[0], engine="openpyxl")
-
-    # 清理欄名
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def find_trade_date(df: pd.DataFrame) -> str:
-    """
-    優先：從檔案內找「資料日期」/「日期」等字樣。
-    若找不到，就用今天日期。
-    """
-    # 盡量從表格裡找包含日期的欄位/值
-    candidates = []
-    for col in df.columns:
-        if any(k in col for k in ["日期", "資料日期", "Data", "Date"]):
-            candidates.append(col)
-
-    # 若有日期欄，試著取第一個非空
-    for col in candidates:
-        s = df[col].dropna()
-        if not s.empty:
-            v = s.iloc[0]
-            try:
-                d = pd.to_datetime(v).date()
-                return d.strftime("%Y%m%d")
-            except Exception:
-                pass
-
-    # fallback：今天
-    return dt.date.today().strftime("%Y%m%d")
-
-
-def standardize_holdings(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    把 ezmoney 匯出的表整理成固定欄位：
-    stock_id, stock_name, shares
-    """
-    # 常見欄位可能是：股票代號 / 股票名稱 / 持股股數 或 單位數 等
-    # 這裡用「包含字」的方式去猜
-    colmap = {}
-
-    def pick_col(keys):
-        for k in keys:
-            for c in df.columns:
-                if k in str(c):
-                    return c
-        return None
-
-    code_col = pick_col(["股票代號", "證券代號", "代號", "Stock", "Code"])
-    name_col = pick_col(["股票名稱", "證券名稱", "名稱", "Name"])
-    shares_col = pick_col(["股數", "持股股數", "數量", "單位", "持股數", "Shares", "Units"])
+    # Column mapping (robust)
+    code_col = pick_column(df.columns, ["代號", "股票代號", "標的代號", "證券代號"])
+    name_col = pick_column(df.columns, ["名稱", "標的名稱", "股票名稱", "股名"])
+    shares_col = pick_column(df.columns, ["股數", "持股股數", "數量", "持有股數"])
 
     if not code_col or not shares_col:
         raise RuntimeError(
-            "找不到必要欄位（代號/股數）。\n"
+            f"找不到必要欄位（代號/股數）。\n"
             f"目前欄位：{list(df.columns)}"
         )
 
-    out = df[[code_col] + ([name_col] if name_col else []) + [shares_col]].copy()
-    out.columns = ["stock_id"] + (["stock_name"] if name_col else []) + ["shares"]
+    # Keep needed columns
+    keep = [code_col, shares_col]
+    if name_col:
+        keep.insert(1, name_col)
 
-    # 清理
-    out["stock_id"] = out["stock_id"].astype(str).str.strip()
-    if "stock_name" in out.columns:
-        out["stock_name"] = out["stock_name"].astype(str).str.strip()
-
-    # shares 轉數字（去逗號）
-    out["shares"] = (
-        out["shares"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace(" ", "", regex=False)
-    )
-    out["shares"] = pd.to_numeric(out["shares"], errors="coerce").fillna(0).astype("int64")
-
-    # 去掉代號空的列
-    out = out[out["stock_id"].str.len() > 0].copy()
-
-    # 同代號合併（保險）
-    grp_cols = ["stock_id"] + (["stock_name"] if "stock_name" in out.columns else [])
-    out = out.groupby(grp_cols, as_index=False)["shares"].sum()
-
-    return out.sort_values(["shares"], ascending=False).reset_index(drop=True)
-
-
-def find_previous_parsed_csv(today_yyyymmdd: str) -> pathlib.Path | None:
-    # 找 parsed 內「日期 < today」的最新一個
-    csvs = sorted(PARSED_DIR.glob("00981A_holdings_*.csv"))
-    prev = None
-    for p in csvs:
-        # 00981A_holdings_YYYYMMDD.csv
-        stem = p.stem
-        ymd = stem.split("_")[-1]
-        if ymd.isdigit() and ymd < today_yyyymmdd:
-            prev = p
-    return prev
-
-
-def diff_holdings(today_df: pd.DataFrame, prev_df: pd.DataFrame) -> pd.DataFrame:
-    # 以 stock_id 為主鍵
-    t = today_df.copy()
-    p = prev_df.copy()
-
-    if "stock_name" not in t.columns:
-        t["stock_name"] = ""
-    if "stock_name" not in p.columns:
-        p["stock_name"] = ""
-
-    merged = t.merge(
-        p[["stock_id", "stock_name", "shares"]].rename(columns={"shares": "shares_prev"}),
-        on="stock_id",
-        how="outer",
-        suffixes=("", "_prev"),
+    df = df[keep].copy()
+    df = df.rename(
+        columns={
+            code_col: "code",
+            (name_col or ""): "name" if name_col else (name_col or ""),
+            shares_col: "shares",
+        }
     )
 
-    # stock_name：優先今天，沒有就用昨天
-    merged["stock_name"] = merged["stock_name"].replace("nan", "")
-    merged["stock_name_prev"] = merged.get("stock_name_prev", "").astype(str)
-    merged["stock_name"] = merged["stock_name"].where(merged["stock_name"].astype(str).str.len() > 0, merged["stock_name_prev"])
+    if "name" not in df.columns:
+        df["name"] = ""
 
-    merged["shares"] = merged["shares"].fillna(0).astype("int64")
-    merged["shares_prev"] = merged["shares_prev"].fillna(0).astype("int64")
-    merged["delta_shares"] = merged["shares"] - merged["shares_prev"]
+    # Clean rows
+    df["code"] = df["code"].astype(str).str.strip()
+    df["name"] = df["name"].astype(str).str.strip()
+    df["shares"] = df["shares"].apply(to_int_safe)
 
-    def classify(row):
-        if row["shares_prev"] == 0 and row["shares"] > 0:
-            return "新增"
-        if row["shares_prev"] > 0 and row["shares"] == 0:
-            return "出清"
-        if row["delta_shares"] > 0:
-            return "加碼"
-        if row["delta_shares"] < 0:
-            return "減碼"
-        return "持平"
+    # Filter out empty / header-like / totals
+    df = df[df["code"].notna()]
+    df = df[df["code"].str.len() > 0]
+    df = df[~df["code"].str.contains("合計|總計|小計", regex=True, na=False)]
 
-    merged["action"] = merged.apply(classify, axis=1)
+    # Some ETFs might include non-stock assets; keep only codes that look like TW stock id (digits) or ticker-like
+    # For 00981A mostly TW stocks; keep digits-only or alnum
+    df = df[df["code"].str.match(r"^[0-9A-Za-z.\-]+$", na=False)]
 
-    # 排序：先看新增/出清，再看變動幅度
-    order = {"新增": 0, "出清": 1, "加碼": 2, "減碼": 3, "持平": 4}
-    merged["action_rank"] = merged["action"].map(order).fillna(99).astype(int)
+    # Aggregate if duplicated codes appear
+    df = df.groupby(["code", "name"], as_index=False)["shares"].sum()
 
-    merged = merged.sort_values(
-        ["action_rank", "delta_shares"],
-        ascending=[True, False],
-    ).drop(columns=["action_rank", "stock_name_prev"], errors="ignore")
+    # Sort by shares desc
+    df = df.sort_values("shares", ascending=False).reset_index(drop=True)
+    return df, data_date
 
-    return merged.reset_index(drop=True)
+
+def compute_diff(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return diff dataframe with columns:
+      code, name, prev_shares, curr_shares, delta, status
+    status: NEW / OUT / UP / DOWN / SAME
+    """
+    prev = prev_df.copy()
+    curr = curr_df.copy()
+
+    prev = prev.rename(columns={"shares": "prev_shares"})
+    curr = curr.rename(columns={"shares": "curr_shares"})
+
+    merged = prev.merge(curr, on=["code"], how="outer", suffixes=("_prev", "_curr"))
+
+    # Choose name from current if available else prev
+    merged["name"] = merged.get("name_curr", "").fillna("")
+    if "name_prev" in merged.columns:
+        merged.loc[merged["name"].eq("") | merged["name"].isna(), "name"] = merged["name_prev"].fillna("")
+
+    merged["prev_shares"] = merged["prev_shares"].fillna(0).astype(int)
+    merged["curr_shares"] = merged["curr_shares"].fillna(0).astype(int)
+    merged["delta"] = merged["curr_shares"] - merged["prev_shares"]
+
+    def status_row(r):
+        if r["prev_shares"] == 0 and r["curr_shares"] > 0:
+            return "NEW"
+        if r["prev_shares"] > 0 and r["curr_shares"] == 0:
+            return "OUT"
+        if r["delta"] > 0:
+            return "UP"
+        if r["delta"] < 0:
+            return "DOWN"
+        return "SAME"
+
+    merged["status"] = merged.apply(status_row, axis=1)
+
+    # Order: NEW, UP, DOWN, OUT, SAME
+    order_map = {"NEW": 0, "UP": 1, "DOWN": 2, "OUT": 3, "SAME": 4}
+    merged["order"] = merged["status"].map(order_map).fillna(99)
+    merged = merged.sort_values(["order", "delta"], ascending=[True, False]).drop(columns=["order"])
+
+    # Keep tidy columns
+    merged = merged[["code", "name", "prev_shares", "curr_shares", "delta", "status"]].reset_index(drop=True)
+    return merged
+
+
+def write_summary_markdown(diff_df: pd.DataFrame, out_md: pathlib.Path, data_date: str) -> None:
+    def top_rows(status, n=15):
+        sub = diff_df[diff_df["status"] == status].copy()
+        if status in ("DOWN", "OUT"):
+            sub = sub.sort_values("delta")  # most negative first
+        elif status in ("UP", "NEW"):
+            sub = sub.sort_values("delta", ascending=False)
+        return sub.head(n)
+
+    lines = []
+    lines.append(f"# 00981A Holdings Diff ({data_date})\n")
+
+    counts = diff_df["status"].value_counts().to_dict()
+    lines.append("## Summary\n")
+    lines.append(
+        f"- NEW: {counts.get('NEW',0)} | UP: {counts.get('UP',0)} | DOWN: {counts.get('DOWN',0)} | OUT: {counts.get('OUT',0)} | SAME: {counts.get('SAME',0)}\n"
+    )
+
+    for sec, label in [("NEW", "新增持股"), ("UP", "加碼"), ("DOWN", "減碼"), ("OUT", "出清")]:
+        sub = top_rows(sec, n=20)
+        lines.append(f"## {label} ({sec})\n")
+        if sub.empty:
+            lines.append("_None_\n")
+            continue
+        lines.append("| code | name | prev | curr | delta | status |\n")
+        lines.append("|---|---|---:|---:|---:|---|\n")
+        for _, r in sub.iterrows():
+            lines.append(
+                f"| {r['code']} | {str(r['name']).replace('|',' ')} | {r['prev_shares']} | {r['curr_shares']} | {r['delta']} | {r['status']} |\n"
+            )
+        lines.append("\n")
+
+    out_md.write_text("".join(lines), encoding="utf-8")
 
 
 def main():
-    safe_mkdirs()
+    base = pathlib.Path("data")
+    raw_dir = base / "raw"
+    out_dir = base / "out"
+    ensure_dir(raw_dir)
+    ensure_dir(out_dir)
 
-    raw = download_bytes()
+    # 1) download raw xlsx to temp name first
+    session = requests.Session()
+    tmp_path = raw_dir / "00981A_portfolio_tmp.xlsx"
+    download_xlsx(session, tmp_path)
 
-    # 保存原始檔（方便 debug）
-    today = dt.date.today().strftime("%Y%m%d")
-    raw_path = RAW_DIR / f"00981A_raw_{today}.bin"
-    raw_path.write_bytes(raw)
+    # 2) parse holdings and data_date
+    holdings_df, data_date = parse_holdings_from_xlsx(tmp_path)
 
-    xlsx_bytes = normalize_to_xlsx_bytes(raw)
+    # fallback date
+    if not data_date:
+        data_date = dt.date.today().strftime("%Y%m%d")
 
-    # 保存 xlsx
-    xlsx_path = RAW_DIR / f"00981A_portfolio_{today}.xlsx"
-    xlsx_path.write_bytes(xlsx_bytes)
-    print(f"[OK] Saved XLSX to {xlsx_path}")
+    # 3) rename raw file based on data_date
+    raw_path = raw_dir / f"00981A_portfolio_{data_date}.xlsx"
+    if raw_path.exists():
+        # If already exists, keep the existing one and remove tmp
+        tmp_path.unlink(missing_ok=True)
+        print(f"[INFO] Raw XLSX already exists: {raw_path}")
+    else:
+        tmp_path.replace(raw_path)
+        print(f"[OK] Raw XLSX moved to: {raw_path}")
 
-    df0 = read_xlsx_to_df(xlsx_bytes)
-    data_date = find_trade_date(df0)  # 優先用檔內日期
-    print(f"[INFO] data_date = {data_date}")
+    # 4) save standardized holdings
+    holdings_path = out_dir / f"00981A_holdings_{data_date}.csv"
+    holdings_df.to_csv(holdings_path, index=False, encoding="utf-8-sig")
+    print(f"[OK] Saved standardized holdings to {holdings_path}")
 
-    holdings = standardize_holdings(df0)
+    # also keep a "latest"
+    latest_path = out_dir / "00981A_latest.csv"
 
-    # 輸出 parsed
-    parsed_path = PARSED_DIR / f"00981A_holdings_{data_date}.csv"
-    holdings.to_csv(parsed_path, index=False, encoding="utf-8-sig")
-    print(f"[OK] Saved parsed holdings to {parsed_path}")
+    # 5) diff vs previous latest
+    if latest_path.exists():
+        prev_df = pd.read_csv(latest_path)
+        # Ensure columns exist
+        if not {"code", "shares"}.issubset(set(prev_df.columns)):
+            print("[WARN] latest.csv 格式不對，將略過 diff。")
+        else:
+            diff_df = compute_diff(prev_df, holdings_df)
+            diff_path = out_dir / f"00981A_diff_{data_date}.csv"
+            diff_df.to_csv(diff_path, index=False, encoding="utf-8-sig")
+            print(f"[OK] Saved diff to {diff_path}")
 
-    # 更新 latest
-    latest_path = LATEST_DIR / "00981A_holdings_latest.csv"
-    holdings.to_csv(latest_path, index=False, encoding="utf-8-sig")
+            md_path = out_dir / f"00981A_diff_{data_date}.md"
+            write_summary_markdown(diff_df, md_path, data_date)
+            print(f"[OK] Saved diff summary to {md_path}")
+    else:
+        print("[INFO] No previous latest.csv found; diff skipped (first run).")
 
-    # diff（如果有前一天）
-    prev_path = find_previous_parsed_csv(data_date)
-    if prev_path is None:
-        print("[INFO] 找不到前一個 parsed CSV，跳過 diff")
-        return
-
-    prev_df = pd.read_csv(prev_path)
-    diff_df = diff_holdings(holdings, prev_df)
-
-    diff_path = DIFF_DIR / f"00981A_diff_{prev_path.stem.split('_')[-1]}_to_{data_date}.csv"
-    diff_df.to_csv(diff_path, index=False, encoding="utf-8-sig")
-    print(f"[OK] Saved diff to {diff_path}")
-
-    # 也順便產生一份摘要 markdown
-    md_path = DIFF_DIR / f"00981A_diff_{prev_path.stem.split('_')[-1]}_to_{data_date}.md"
-    def top_lines(action, n=15):
-        sub = diff_df[diff_df["action"] == action].copy()
-        if sub.empty:
-            return ["- （無）"]
-        # 只列出前 n
-        lines = []
-        for _, r in sub.head(n).iterrows():
-            lines.append(f"- {r['stock_id']} {str(r.get('stock_name',''))}：{r['shares_prev']} → {r['shares']}（{r['delta_shares']:+,}）")
-        return lines
-
-    md = []
-    md.append(f"# 00981A 持股變動 {prev_path.stem.split('_')[-1]} → {data_date}\n")
-    md.append("## 新增\n" + "\n".join(top_lines("新增")))
-    md.append("\n## 出清\n" + "\n".join(top_lines("出清")))
-    md.append("\n## 加碼（前 15）\n" + "\n".join(top_lines("加碼")))
-    md.append("\n## 減碼（前 15）\n" + "\n".join(top_lines("減碼")))
-    md_path.write_text("\n".join(md), encoding="utf-8")
-    print(f"[OK] Saved diff summary to {md_path}")
+    # 6) update latest
+    holdings_df.to_csv(latest_path, index=False, encoding="utf-8-sig")
+    print(f"[OK] Updated latest to {latest_path}")
 
 
 if __name__ == "__main__":
