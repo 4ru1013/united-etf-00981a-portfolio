@@ -1,28 +1,15 @@
 import datetime
 import pathlib
-import zipfile
-import io
 import requests
 
 BASE_URL = "https://www.ezmoney.com.tw"
 FUND_CODE = "49YTW"  # 00981A 的 fundCode
 
+# 先進 Info 頁讓網站設好 cookie（比較穩定）
 INFO_URL = f"{BASE_URL}/ETF/Fund/Info?FundCode={FUND_CODE}"
+
+# 真正的 XLSX 下載網址（從 getAssetXLSNPOI 推回來的）
 EXPORT_URL = f"{BASE_URL}/ETF/Fund/AssetExcelNPOI?fundCode={FUND_CODE}"
-
-
-def looks_like_zip(data: bytes) -> bool:
-    return len(data) >= 4 and data[:2] == b"PK"
-
-
-def looks_like_xlsx(data: bytes) -> bool:
-    # xlsx 本質也是 zip，所以只用 PK 不能分辨；但 content-type 會比較準
-    return looks_like_zip(data)
-
-
-def looks_like_html(data: bytes) -> bool:
-    head = data[:200].lstrip().lower()
-    return head.startswith(b"<!doctype html") or head.startswith(b"<html") or b"<html" in head
 
 
 def download_and_save():
@@ -35,72 +22,26 @@ def download_and_save():
         )
     }
 
-    # output dir
-    data_dir = pathlib.Path("data") / "00981A"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # date tag
-    today = datetime.date.today().strftime("%Y%m%d")
-
-    # 1) open info page to set cookies
+    # 1️⃣ 先打 Info 頁，取得必要 cookie / session
     resp_info = session.get(INFO_URL, headers=headers, timeout=30)
     resp_info.raise_for_status()
-    print("[INFO] Opened INFO page OK (cookie/session ready)")
+    print("[INFO] 打開基金資訊頁成功")
 
-    # 2) download
-    resp = session.get(EXPORT_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
+    # 2️⃣ 直接打匯出 XLSX 的 API
+    resp_xlsx = session.get(EXPORT_URL, headers=headers, timeout=60)
+    resp_xlsx.raise_for_status()
+    print(f"[INFO] 下載 API 回應 Content-Type: {resp_xlsx.headers.get('Content-Type')}")
 
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    print(f"[INFO] Download status={resp.status_code} content-type={ctype}")
-    print(f"[INFO] Content-Length={resp.headers.get('Content-Length')} bytes={len(resp.content)}")
-    print(f"[INFO] First 16 bytes={resp.content[:16]!r}")
+    # 3️⃣ 存檔到 data 資料夾，以日期命名
+    today = datetime.date.today().strftime("%Y%m%d")
+    data_dir = pathlib.Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    content = resp.content
+    filename = f"00981A_portfolio_{today}.xlsx"
+    out_path = data_dir / filename
+    out_path.write_bytes(resp_xlsx.content)
 
-    # 3) decide save format
-    if "zip" in ctype or looks_like_zip(content):
-        zip_path = data_dir / f"00981A_{today}.zip"
-        zip_path.write_bytes(content)
-        print(f"[OK] Saved ZIP to {zip_path}")
-
-        # list zip contents
-        try:
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                names = z.namelist()
-                print("[INFO] ZIP contains:")
-                for n in names:
-                    print("  -", n)
-
-                # try extract first .xlsx if any
-                xlsx_candidates = [n for n in names if n.lower().endswith(".xlsx")]
-                if xlsx_candidates:
-                    pick = xlsx_candidates[0]
-                    xlsx_bytes = z.read(pick)
-                    xlsx_path = data_dir / f"00981A_{today}.xlsx"
-                    xlsx_path.write_bytes(xlsx_bytes)
-                    print(f"[OK] Extracted XLSX from ZIP -> {xlsx_path} (from {pick})")
-                else:
-                    print("[WARN] ZIP has no .xlsx inside. Kept ZIP for inspection; workflow will NOT fail.")
-        except zipfile.BadZipFile:
-            # sometimes "PK" but not a real zip, rare — keep raw bytes for debug
-            raw_path = data_dir / f"00981A_{today}.bin"
-            raw_path.write_bytes(content)
-            print(f"[WARN] Content looked like ZIP but BadZipFile. Saved raw -> {raw_path}. workflow will NOT fail.")
-
-    elif "spreadsheet" in ctype or "excel" in ctype or looks_like_xlsx(content):
-        xlsx_path = data_dir / f"00981A_{today}.xlsx"
-        xlsx_path.write_bytes(content)
-        print(f"[OK] Saved XLSX to {xlsx_path}")
-
-    elif looks_like_html(content) or "text/html" in ctype:
-        html_path = data_dir / f"00981A_{today}.html"
-        html_path.write_bytes(content)
-        print(f"[WARN] Got HTML instead of file. Saved HTML -> {html_path} (workflow will NOT fail)")
-    else:
-        unknown_path = data_dir / f"00981A_{today}.bin"
-        unknown_path.write_bytes(content)
-        print(f"[WARN] Unknown content-type. Saved raw -> {unknown_path} (workflow will NOT fail)")
+    print(f"[OK] Saved XLSX to {out_path}")
 
 
 if __name__ == "__main__":
