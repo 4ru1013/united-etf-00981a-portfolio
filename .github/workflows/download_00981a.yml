@@ -2,7 +2,6 @@ name: Download 00981A portfolio
 
 on:
   schedule:
-    # 週一到週五 08:30 UTC => 台灣時間 16:30
     - cron: "30 8 * * 1-5"
   workflow_dispatch: {}
 
@@ -16,7 +15,6 @@ concurrency:
 jobs:
   download:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,31 +32,26 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests beautifulsoup4
+            pip install requests
           fi
 
-      - name: Download 00981A (run script)
+      - name: Run downloader
         run: |
           python download_00981a.py
 
-      - name: Debug list downloaded files
+      - name: Debug list files
         run: |
-          echo "== List data =="
-          ls -al data || true
-          echo "== List data/00981A =="
+          echo "== data/00981A =="
           ls -al data/00981A || true
-          echo "== file types =="
-          (command -v file && file data/00981A/*) || true
           echo "== unzip listing (if any) =="
           (command -v unzip && unzip -l data/00981A/*.zip) || true
 
-      - name: Upload debug artifacts on failure
-        if: failure()
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-00981A-files
-          path: |
-            data/00981A/**
+          name: 00981A-files
+          path: data/00981A/**
           if-no-files-found: ignore
           retention-days: 7
 
@@ -66,9 +59,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           if [ -n "$(git status --porcelain)" ]; then
-            git add data || true
+            git add data download_00981a.py .github/workflows/download_00981a.yml || true
             git commit -m "Auto download 00981A portfolio $(date -u +'%Y-%m-%d')"
             git push
           else
