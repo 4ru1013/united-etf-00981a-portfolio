@@ -2,8 +2,7 @@ name: Download 00981A portfolio
 
 on:
   schedule:
-    # 週一到週五 08:30 UTC => 台灣時間 16:30
-    - cron: "30 8 * * 1-5"
+    - cron: "30 8 * * 1-5"  # 16:30 Asia/Taipei
   workflow_dispatch: {}
 
 permissions:
@@ -29,18 +28,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download XLSX
+      - name: Download + Parse (generate stock_pool)
         run: |
           python download_00981a.py
+          # 建議你在 download_00981a.py 內最後輸出：
+          # data/stock_pool/00981A_latest.csv (以及可選的 json)
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-00981A-${{ github.run_id }}
+          path: data/00981A/*
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 只 commit 乾淨產物（避免 repo 膨脹）
+          git add data/stock_pool || true
+          # (可選) 若你也想留原始 xlsx，再開啟這行
+          # git add data/00981A/*.xlsx || true
+
           if [ -n "$(git status --porcelain)" ]; then
-            # 直接把整個 data 資料夾加入（裡面有 xlsx / html_snapshot）
-            git add data || true
-            git commit -m "Auto download 00981A portfolio $(date -u +'%Y-%m-%d')"
+            git commit -m "Update 00981A stock pool $(date -u +'%Y-%m-%d')"
             git push
           else
             echo "No changes, nothing to commit."
