@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: download-00981a
+  cancel-in-progress: false
+
 jobs:
   download:
     runs-on: ubuntu-latest
@@ -27,18 +31,43 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4
+          fi
 
-      - name: Download XLSX
+      - name: Download 00981A (run script)
         run: |
           python download_00981a.py
+
+      - name: Debug list downloaded files
+        run: |
+          echo "== List data =="
+          ls -al data || true
+          echo "== List data/00981A =="
+          ls -al data/00981A || true
+          echo "== file types =="
+          (command -v file && file data/00981A/*) || true
+          echo "== unzip listing (if any) =="
+          (command -v unzip && unzip -l data/00981A/*.zip) || true
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-00981A-files
+          path: |
+            data/00981A/**
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if [ -n "$(git status --porcelain)" ]; then
-            # 直接把整個 data 資料夾加入（裡面有 xlsx / html_snapshot）
             git add data || true
             git commit -m "Auto download 00981A portfolio $(date -u +'%Y-%m-%d')"
             git push
