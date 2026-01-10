@@ -244,7 +244,16 @@ def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Opt
         df["name"] = ""
 
     # Clean rows
-    df["code"] = df["code"].astype(str).str.strip()
+    # 先轉字串、去空白、去掉尾巴的 .0（Excel 常見）
+    df["code"] = (
+        df["code"]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+    )
+
+    # 台股代號（純數字）補到 4 碼：0050/0052 會變回來
+    df["code"] = df["code"].apply(lambda x: x.zfill(4) if x.isdigit() else x)
     df["name"] = df["name"].astype(str).str.strip()
     df["shares"] = df["shares"].apply(to_int_safe)
 
@@ -385,7 +394,8 @@ def main():
 
     # 5) diff vs previous latest
     if latest_path.exists():
-        prev_df = pd.read_csv(latest_path)
+        prev_df = pd.read_csv(latest_path, dtype={"code": "string"})
+        prev_df["code"] = prev_df["code"].astype(str).str.strip()
         # Ensure columns exist
         if not {"code", "shares"}.issubset(set(prev_df.columns)):
             print("[WARN] latest.csv 格式不對，將略過 diff。")
