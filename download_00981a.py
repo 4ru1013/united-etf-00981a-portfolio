@@ -100,7 +100,6 @@ def find_header_row(df_raw: pd.DataFrame) -> Optional[int]:
     that looks like the real header (contains keywords like 代號/股數/名稱).
     Return row index (0-based) if found.
     """
-    # Candidate keywords (you can add more if needed)
     must_have_any = ["代號", "股票代號", "標的代號", "證券代號"]
     should_have_any = ["名稱", "標的名稱", "股票名稱", "股名"]
     shares_any = ["股數", "持股股數", "數量", "持有股數"]
@@ -115,7 +114,6 @@ def find_header_row(df_raw: pd.DataFrame) -> Optional[int]:
 
         has_code = any(k in row_join for k in must_have_any)
         has_shares = any(k in row_join for k in shares_any)
-        # Sometimes there is no "名稱" but there is code+shares already strong enough
         has_name = any(k in row_join for k in should_have_any)
 
         if has_code and has_shares:
@@ -147,9 +145,7 @@ def to_int_safe(x) -> int:
     s = str(x).strip()
     if s == "" or s.lower() == "nan":
         return 0
-    # remove commas and spaces
     s = s.replace(",", "").replace(" ", "")
-    # handle something like '1,234.0'
     try:
         return int(float(s))
     except ValueError:
@@ -192,11 +188,9 @@ def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Opt
     else:
         print("[WARN] 無法從檔案內抓到資料日期，將以今天日期做檔名（但仍可解析持股）")
 
-    # Read sheet with header=None first (robust)
     df0 = pd.read_excel(xlsx_path, sheet_name=0, header=None, engine="openpyxl")
     header_row = find_header_row(df0)
     if header_row is None:
-        # Debug: show first few rows as columns-like
         preview = df0.head(5).to_string(index=False)
         raise RuntimeError(
             "找不到表頭列（代號/股數）。\n"
@@ -204,7 +198,6 @@ def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Opt
             f"前 5 列預覽：\n{preview}"
         )
 
-    # Re-read with correct header
     df = pd.read_excel(
         xlsx_path,
         sheet_name=0,
@@ -212,10 +205,8 @@ def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Opt
         engine="openpyxl",
     )
 
-    # Normalize col names
     df.columns = [normalize_colname(c) for c in df.columns]
 
-    # Column mapping (robust)
     code_col = pick_column(df.columns, ["代號", "股票代號", "標的代號", "證券代號"])
     name_col = pick_column(df.columns, ["名稱", "標的名稱", "股票名稱", "股名"])
     shares_col = pick_column(df.columns, ["股數", "持股股數", "數量", "持有股數"])
@@ -226,41 +217,28 @@ def parse_holdings_from_xlsx(xlsx_path: pathlib.Path) -> Tuple[pd.DataFrame, Opt
             f"目前欄位：{list(df.columns)}"
         )
 
-    # Keep needed columns
-    keep = [code_col, shares_col]
+    rename_map = {code_col: "code", shares_col: "shares"}
     if name_col:
-        keep.insert(1, name_col)
+        rename_map[name_col] = "name"
 
-    df = df[keep].copy()
-    df = df.rename(
-        columns={
-            code_col: "code",
-            (name_col or ""): "name" if name_col else (name_col or ""),
-            shares_col: "shares",
-        }
-    )
+    df = df[list(rename_map.keys())].copy()
+    df = df.rename(columns=rename_map)
 
     if "name" not in df.columns:
         df["name"] = ""
 
-    # Clean rows
-    df["code"] = df["code"].astype(str).str.strip()
-    df["name"] = df["name"].astype(str).str.strip()
+    # code 永遠當作字串（識別碼，不是數值）
+    df["code"] = df["code"].astype("string").str.strip()
+    df["name"] = df["name"].astype("string").str.strip()
     df["shares"] = df["shares"].apply(to_int_safe)
 
-    # Filter out empty / header-like / totals
     df = df[df["code"].notna()]
     df = df[df["code"].str.len() > 0]
     df = df[~df["code"].str.contains("合計|總計|小計", regex=True, na=False)]
 
-    # Some ETFs might include non-stock assets; keep only codes that look like TW stock id (digits) or ticker-like
-    # For 00981A mostly TW stocks; keep digits-only or alnum
     df = df[df["code"].str.match(r"^[0-9A-Za-z.\-]+$", na=False)]
 
-    # Aggregate if duplicated codes appear
     df = df.groupby(["code", "name"], as_index=False)["shares"].sum()
-
-    # Sort by shares desc
     df = df.sort_values("shares", ascending=False).reset_index(drop=True)
     return df, data_date
 
@@ -274,12 +252,15 @@ def compute_diff(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
     prev = prev_df.copy()
     curr = curr_df.copy()
 
+    # 雙保險：merge key 永遠統一成字串，避免 int64 vs object 造成 merge 失敗
+    prev["code"] = prev["code"].astype("string").str.strip()
+    curr["code"] = curr["code"].astype("string").str.strip()
+
     prev = prev.rename(columns={"shares": "prev_shares"})
     curr = curr.rename(columns={"shares": "curr_shares"})
 
     merged = prev.merge(curr, on=["code"], how="outer", suffixes=("_prev", "_curr"))
 
-    # Choose name from current if available else prev
     merged["name"] = merged.get("name_curr", "").fillna("")
     if "name_prev" in merged.columns:
         merged.loc[merged["name"].eq("") | merged["name"].isna(), "name"] = merged["name_prev"].fillna("")
@@ -301,12 +282,10 @@ def compute_diff(prev_df: pd.DataFrame, curr_df: pd.DataFrame) -> pd.DataFrame:
 
     merged["status"] = merged.apply(status_row, axis=1)
 
-    # Order: NEW, UP, DOWN, OUT, SAME
     order_map = {"NEW": 0, "UP": 1, "DOWN": 2, "OUT": 3, "SAME": 4}
     merged["order"] = merged["status"].map(order_map).fillna(99)
     merged = merged.sort_values(["order", "delta"], ascending=[True, False]).drop(columns=["order"])
 
-    # Keep tidy columns
     merged = merged[["code", "name", "prev_shares", "curr_shares", "delta", "status"]].reset_index(drop=True)
     return merged
 
@@ -315,7 +294,7 @@ def write_summary_markdown(diff_df: pd.DataFrame, out_md: pathlib.Path, data_dat
     def top_rows(status, n=15):
         sub = diff_df[diff_df["status"] == status].copy()
         if status in ("DOWN", "OUT"):
-            sub = sub.sort_values("delta")  # most negative first
+            sub = sub.sort_values("delta")
         elif status in ("UP", "NEW"):
             sub = sub.sort_values("delta", ascending=False)
         return sub.head(n)
@@ -368,7 +347,6 @@ def main():
     # 3) rename raw file based on data_date
     raw_path = raw_dir / f"00981A_portfolio_{data_date}.xlsx"
     if raw_path.exists():
-        # If already exists, keep the existing one and remove tmp
         tmp_path.unlink(missing_ok=True)
         print(f"[INFO] Raw XLSX already exists: {raw_path}")
     else:
@@ -380,13 +358,15 @@ def main():
     holdings_df.to_csv(holdings_path, index=False, encoding="utf-8-sig")
     print(f"[OK] Saved standardized holdings to {holdings_path}")
 
-    # also keep a "latest"
     latest_path = out_dir / "00981A_latest.csv"
 
     # 5) diff vs previous latest
     if latest_path.exists():
-        prev_df = pd.read_csv(latest_path)
-        # Ensure columns exist
+        # 關鍵：強制 code 為字串，避免 pandas 自動判型造成 merge 失敗
+        prev_df = pd.read_csv(latest_path, dtype={"code": "string"})
+        if "code" in prev_df.columns:
+            prev_df["code"] = prev_df["code"].str.strip()
+
         if not {"code", "shares"}.issubset(set(prev_df.columns)):
             print("[WARN] latest.csv 格式不對，將略過 diff。")
         else:
